@@ -21,6 +21,7 @@
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 #include <drm_fourcc.h>
+#include <string.h>
 
 #define DBG_TAG "drm"
 
@@ -614,6 +615,48 @@ err:
 	return -1;
 }
 
+
+
+static int drm_allocate_dumb(struct drm_buffer *buf)
+{
+    struct drm_mode_create_dumb creq;
+    struct drm_mode_map_dumb mreq;
+    uint32_t handles[4] = {0}, pitches[4] = {0}, offsets[4] = {0};
+
+    lv_memset(&creq, 0, sizeof(creq));
+    creq.width = drm_dev.width;
+    creq.height = drm_dev.height;
+    creq.bpp = 32; // Fest auf 32 Bit für XR24
+    drmIoctl(drm_dev.fd, DRM_IOCTL_MODE_CREATE_DUMB, &creq);
+
+    buf->handle = creq.handle;
+    buf->pitch = creq.pitch;
+    buf->size = creq.size;
+
+    lv_memset(&mreq, 0, sizeof(mreq));
+    mreq.handle = creq.handle;
+    drmIoctl(drm_dev.fd, DRM_IOCTL_MODE_MAP_DUMB, &mreq);
+
+    buf->map = mmap(0, creq.size, PROT_READ | PROT_WRITE, MAP_SHARED, drm_dev.fd, mreq.offset);
+    if (buf->map == MAP_FAILED) return -1;
+
+    // ALLES AUF 0 - KEINE OFFSETS HIER
+    handles[0] = creq.handle;
+    pitches[0] = creq.pitch;
+    offsets[0] = 0; 
+
+    if (drmModeAddFB2(drm_dev.fd, drm_dev.width, drm_dev.height, drm_dev.fourcc,
+                        handles, pitches, offsets, &buf->fb_handle, 0)) {
+        return -1;
+    }
+    return 0;
+}
+
+
+
+
+
+/* original fn 
 static int drm_allocate_dumb(struct drm_buffer *buf)
 {
 	struct drm_mode_create_dumb creq;
@@ -621,7 +664,7 @@ static int drm_allocate_dumb(struct drm_buffer *buf)
 	uint32_t handles[4] = {0}, pitches[4] = {0}, offsets[4] = {0};
 	int ret;
 
-	/* create dumb buffer */
+	// create dumb buffer 
 	lv_memset(&creq, 0, sizeof(creq));
 	creq.width = drm_dev.width;
 	creq.height = drm_dev.height;
@@ -636,7 +679,7 @@ static int drm_allocate_dumb(struct drm_buffer *buf)
 	buf->pitch = creq.pitch;
 	buf->size = creq.size;
 
-	/* prepare buffer for memory mapping */
+	// prepare buffer for memory mapping 
 	lv_memset(&mreq, 0, sizeof(mreq));
 	mreq.handle = creq.handle;
 	ret = drmIoctl(drm_dev.fd, DRM_IOCTL_MODE_MAP_DUMB, &mreq);
@@ -648,17 +691,17 @@ static int drm_allocate_dumb(struct drm_buffer *buf)
 	buf->offset = mreq.offset;
 	info("size %lu pitch %u offset %u", buf->size, buf->pitch, buf->offset);
 
-	/* perform actual memory mapping */
+	// perform actual memory mapping 
 	buf->map = mmap(0, creq.size, PROT_READ | PROT_WRITE, MAP_SHARED, drm_dev.fd, mreq.offset);
 	if (buf->map == MAP_FAILED) {
 		err("mmap fail");
 		return -1;
 	}
 
-	/* clear the framebuffer to 0 (= full transparency in ARGB8888) */
+	// clear the framebuffer to 0 (= full transparency in ARGB8888) 
 	lv_memset(buf->map, 0, creq.size);
 
-	/* create framebuffer object for the dumb-buffer */
+	// create framebuffer object for the dumb-buffer 
 	handles[0] = creq.handle;
 	pitches[0] = creq.pitch;
 	offsets[0] = 0;
@@ -671,6 +714,11 @@ static int drm_allocate_dumb(struct drm_buffer *buf)
 
 	return 0;
 }
+*/
+
+
+
+
 
 static int drm_setup_buffers(void)
 {
@@ -711,12 +759,98 @@ void drm_wait_vsync(lv_disp_drv_t * disp_drv)
 	lv_disp_flush_ready(disp_drv);
 }
 
+
 void drm_flush(lv_disp_drv_t * disp_drv, const lv_area_t * area, lv_color_t * color_p)
+{
+    struct drm_buffer *fbuf = &drm_dev.drm_bufs[0];
+    uint32_t bpp = 4;
+    uint32_t hw_offset = 4149248; // Dein Hardware-Offset
+
+    for (int y = 0, i = area->y1; i <= area->y2 ; ++i, ++y) {
+        // Wir berechnen die Position relativ zum Hardware-Offset
+        uint32_t pos = (area->x1 * bpp) + (fbuf->pitch * i);
+        
+        // Wir schreiben NUR, wenn wir innerhalb des gemappten Bereichs sind
+        // Das verhindert den Segfault!
+        if (pos + ( (area->x2 - area->x1 + 1) * bpp) <= fbuf->size) {
+            // Wir schreiben direkt an den Anfang (0) UND mit dem Offset
+            // Einer von beiden MUSS der richtige sein.
+            uint8_t * dest_base = (uint8_t *)fbuf->map + pos;
+            uint8_t * src = (uint8_t *)color_p + ((area->x2 - area->x1 + 1) * bpp * y);
+            
+            lv_memcpy(dest_base, src, (area->x2 - area->x1 + 1) * bpp);
+        }
+    }
+
+    if(lv_disp_flush_is_last(disp_drv)) {
+        drm_dmabuf_set_plane(fbuf);
+        lv_disp_flush_ready(disp_drv);
+    }
+}
+
+
+
+
+
+
+
+/*
+void drm_flush(lv_disp_drv_t * disp_drv, const lv_area_t * area, lv_color_t * color_p)
+{
+    struct drm_buffer *fbuf = &drm_dev.drm_bufs[0];
+    uint32_t bpp = 4;
+    uint32_t w = (area->x2 - area->x1) + 1;
+
+    for (int y = 0, i = area->y1; i <= area->y2 ; ++i, ++y) {
+        // KEIN OFFSET ADDIEREN - Wir schreiben ab Adresse 0
+        uint8_t * dest = (uint8_t *)fbuf->map + (area->x1 * bpp) + (fbuf->pitch * i);
+        uint8_t * src  = (uint8_t *)color_p + (w * bpp * y);
+
+        lv_memcpy(dest, src, w * bpp);
+    }
+
+    if(lv_disp_flush_is_last(disp_drv)) {
+        drm_dmabuf_set_plane(fbuf);
+        lv_disp_flush_ready(disp_drv);
+    }
+}
+*/
+/*
+void drm_flush(lv_disp_drv_t * disp_drv, const lv_area_t * area, lv_color_t * color_p)
+{
+        // FORCE use of the very first buffer (index 0) to avoid the 4MB offset bug 
+        struct drm_buffer *fbuf = &drm_dev.drm_bufs[0];
+
+        // Calculate bytes per pixel (should be 4 for XR24) 
+        uint32_t bpp = LV_COLOR_SIZE / 8;
+        uint32_t w = (area->x2 - area->x1) + 1;
+
+        // Standard Non-direct flush logic with hard-coded pitch sync 
+        for (int y = 0, i = area->y1; i <= area->y2 ; ++i, ++y) {
+                // We calculate the destination address manually to ensure NO OFFSET is added
+                uint8_t * dest = (uint8_t *)fbuf->map + (area->x1 * bpp) + (fbuf->pitch * i);
+                uint8_t * src  = (uint8_t *)color_p + (w * bpp * y);
+                
+                lv_memcpy(dest, src, w * bpp);
+        }
+
+        if(lv_disp_flush_is_last(disp_drv)) {
+                // Tell the hardware to show the buffer we just painted
+                if(drm_dmabuf_set_plane(fbuf)) {
+                        printf("[DRM] Flush fail\n");
+                }
+                
+                // IMPORTANT: Do NOT toggle active_drm_buf_idx. Stay on buffer 0.
+                lv_disp_flush_ready(disp_drv);
+        }
+}
+*/
+/*void drm_flush(lv_disp_drv_t * disp_drv, const lv_area_t * area, lv_color_t * color_p)
 {
 	struct drm_buffer *fbuf = &drm_dev.drm_bufs[drm_dev.active_drm_buf_idx ^ 1];
 
 	if(!disp_drv->direct_mode) {
-		/*Backwards compatibility: Non-direct flush */
+		/*Backwards compatibility: Non-direct flush * /
 		uint32_t w = (area->x2 - area->x1) + 1;
 		for (int y = 0, i = area->y1; i <= area->y2 ; ++i, ++y) {
 			lv_memcpy(fbuf->map + (area->x1 * (LV_COLOR_SIZE / 8)) + (fbuf->pitch * i),
@@ -726,7 +860,7 @@ void drm_flush(lv_disp_drv_t * disp_drv, const lv_area_t * area, lv_color_t * co
 	}
 
 	if(lv_disp_flush_is_last(disp_drv)) {
-		/*Request buffer swap*/
+		/*Request buffer swap* /
 		if(drm_dmabuf_set_plane(fbuf)) {
 			err("Flush fail");
 			return;
@@ -736,7 +870,8 @@ void drm_flush(lv_disp_drv_t * disp_drv, const lv_area_t * area, lv_color_t * co
 
 		drm_dev.active_drm_buf_idx ^= 1;
 	}
-}
+}*/
+
 
 #if LV_COLOR_DEPTH == 32
 #define DRM_FOURCC DRM_FORMAT_XRGB8888
